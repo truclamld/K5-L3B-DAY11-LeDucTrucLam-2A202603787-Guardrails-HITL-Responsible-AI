@@ -36,17 +36,25 @@ def content_filter(response: str) -> dict:
     Returns:
         dict with 'safe', 'issues', and 'redacted' keys
     """
+    response = response or ""
     issues = []
     redacted = response
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # Vietnamese mobile numbers (common 10-digit format, with optional
+        # spaces/dashes between digit groups).
+        "Vietnamese phone number": r"(?<!\d)0\d(?:[ .-]?\d){8,9}(?!\d)",
+        "Email address": r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b",
+        # CMND (9 digits) / CCCD (12 digits). Boundaries avoid matching a
+        # substring inside a longer number.
+        "National ID": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "API key": r"\bsk-[A-Za-z0-9_-]+\b",
+        # Catch common labels such as "password: x", "password=x", and
+        # "password is x"; redact the credential value, not surrounding prose.
+        "Password": r"\bpassword\b\s*(?:(?:is|[:=])\s*)[^\s,;.!?]+",
+        # Protect internal database endpoints if a model repeats one.
+        "Database host": r"\b(?:[\w-]+\.)*vinbank\.internal(?::\d+)?\b",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -172,16 +180,29 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filtered = content_filter(response_text)
+        if not filtered["safe"]:
+            self.redacted_count += 1
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filtered["redacted"])],
+            )
 
-        return llm_response  # TODO: modify if needed
+        # Optional LLM judge checks the sanitized text. It is disabled unless
+        # a judge agent was explicitly configured and use_llm_judge is True.
+        if self.use_llm_judge:
+            text_to_check = filtered["redacted"]
+            judge_result = await llm_safety_check(text_to_check)
+            if not judge_result["safe"]:
+                self.blocked_count += 1
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="Câu trả lời đã bị chặn vì không vượt qua kiểm tra an toàn."
+                    )],
+                )
+
+        return llm_response
 
 
 # ============================================================
